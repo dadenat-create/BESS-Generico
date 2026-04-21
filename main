@@ -1,0 +1,149 @@
+import pandas as pd
+import pulp
+import math
+
+# =========================
+# CONFIG PARAMETRI
+# =========================
+PARAMS = {
+    "P_charge_max": 2.5,
+    "P_discharge_max": 2.5,
+    "SoC_min": 0.5,
+    "SoC_max": 5.0,
+    "eta_rt": 0.90,
+    "P_grid_in_max": 7.0,
+    "P_grid_out_max": 9.0,
+    "oneri": 75.0
+}
+
+# =========================
+# LOAD DATI
+# =========================
+def load_data(price_file, pv_file, load_file):
+    prices = pd.read_excel(price_file).iloc[:,0]
+    pv = pd.read_excel(pv_file).iloc[:,0]
+    load = pd.read_excel(load_file).iloc[:,0]
+
+    T = min(len(prices), len(pv), len(load))
+
+    return (
+        prices[:T].tolist(),
+        pv[:T].tolist(),
+        load[:T].tolist()
+    )
+
+# =========================
+# OTTIMIZZAZIONE
+# =========================
+def optimize(prices, pv, load, p):
+
+    T = len(prices)
+    eta = math.sqrt(p["eta_rt"])
+
+    model = pulp.LpProblem("BESS", pulp.LpMaximize)
+
+    # Variabili
+    cg = pulp.LpVariable.dicts("cg", range(T), 0)
+    cpv = pulp.LpVariable.dicts("cpv", range(T), 0)
+    dg = pulp.LpVariable.dicts("dg", range(T), 0)
+    dl = pulp.LpVariable.dicts("dl", range(T), 0)
+
+    pvl = pulp.LpVariable.dicts("pvl", range(T), 0)
+    pvg = pulp.LpVariable.dicts("pvg", range(T), 0)
+    gtl = pulp.LpVariable.dicts("gtl", range(T), 0)
+
+    soc = pulp.LpVariable.dicts("soc", range(T), p["SoC_min"], p["SoC_max"])
+
+    u = pulp.LpVariable.dicts("mode", range(T), cat="Binary")
+
+    # Obiettivo
+    model += pulp.lpSum([
+        prices[t]*dg[t]
+        - prices[t]*cg[t]
+        - prices[t]*cpv[t]
+        + p["oneri"]*dl[t]
+        for t in range(T)
+    ])
+
+    for t in range(T):
+
+        # Mutua esclusione
+        model += cg[t] + cpv[t] <= p["P_charge_max"] * u[t]
+        model += dg[t] + dl[t] <= p["P_discharge_max"] * (1-u[t])
+
+        # Limiti potenza
+        model += cg[t] + cpv[t] <= p["P_charge_max"]
+        model += dg[t] + dl[t] <= p["P_discharge_max"]
+
+        # Bilanci
+        model += pv[t] == pvl[t] + cpv[t] + pvg[t]
+        model += load[t] == pvl[t] + dl[t] + gtl[t]
+
+        # Rete
+        model += dg[t] + pvg[t] <= p["P_grid_in_max"]
+        model += cg[t] + gtl[t] <= p["P_grid_out_max"]
+
+        # SOC
+        if t == 0:
+            model += soc[t] == p["SoC_min"] + eta*(cg[t]+cpv[t]) - (dg[t]+dl[t])/eta
+        else:
+            model += soc[t] == soc[t-1] + eta*(cg[t]+cpv[t]) - (dg[t]+dl[t])/eta
+
+    # Solve
+    model.solve(pulp.PULP_CBC_CMD(msg=0))
+
+    # Output
+    df = pd.DataFrame({
+        "Prezzo": prices,
+        "PV": pv,
+        "Load": load,
+        "Charge_grid": [cg[t].value() for t in range(T)],
+        "Charge_PV": [cpv[t].value() for t in range(T)],
+        "Discharge_grid": [dg[t].value() for t in range(T)],
+        "Discharge_load": [dl[t].value() for t in range(T)],
+        "SoC": [soc[t].value() for t in range(T)]
+    })
+
+    df["Profit"] = (
+        df["Prezzo"]*df["Discharge_grid"]
+        - df["Prezzo"]*df["Charge_grid"]
+        - df["Prezzo"]*df["Charge_PV"]
+        + p["oneri"]*df["Discharge_load"]
+    )
+
+    return df
+
+# =========================
+# EXPORT
+# =========================
+def export_results(df, output_file):
+
+    df["Hour"] = df.index
+
+    daily = df.groupby(df.index // 24)["Profit"].sum()
+
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name="Dettaglio")
+        daily.to_excel(writer, sheet_name="Giornaliero")
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+
+    # FILE INPUT (modifica qui)
+    price_file = "prezzi.xlsx"
+    pv_file = "pv.xlsx"
+    load_file = "load.xlsx"
+
+    output_file = "risultati_bess.xlsx"
+
+    prices, pv, load = load_data(price_file, pv_file, load_file)
+
+    df = optimize(prices, pv, load, PARAMS)
+
+    export_results(df, output_file)
+
+    print("✅ Ottimizzazione completata")
+    print("💰 Profit totale:", round(df["Profit"].sum(),2))
+    print("📁 File salvato:", output_file)
