@@ -1,6 +1,6 @@
 streamlit
 pandas
+numpy
+scipy
 plotly
 openpyxl
-pulp==2.7.0
-coin-or-cbc
