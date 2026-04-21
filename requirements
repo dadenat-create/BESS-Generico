@@ -3,3 +3,4 @@ pandas
 plotly
 openpyxl
 pulp==2.7.0
+coin-or-cbc
