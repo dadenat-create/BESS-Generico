@@ -1,104 +1,94 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from ortools.linear_solver import pywraplp
 import plotly.graph_objects as go
 import io
-import math
 
 st.set_page_config(layout="wide")
-st.title("⚡ BESS Optimizer – Ora Energy (Client Version)")
+st.title("⚡ BESS Optimizer – Ora Energy")
 
 # =========================
 # PARAMETRI
 # =========================
 st.sidebar.header("Parametri BESS")
 
-P_charge = st.sidebar.number_input("Potenza carica (MW)", value=2.5)
-P_discharge = st.sidebar.number_input("Potenza scarica (MW)", value=2.5)
+P_max = st.sidebar.number_input("Potenza BESS (MW)", value=2.5)
+E_max = st.sidebar.number_input("Energia BESS (MWh)", value=5.0)
 
-SoC_min = st.sidebar.number_input("SoC min (MWh)", value=0.5)
-SoC_max = st.sidebar.number_input("SoC max (MWh)", value=5.0)
+SoC_min = st.sidebar.number_input("SoC min (%)", value=10.0)/100
+SoC_max = st.sidebar.number_input("SoC max (%)", value=100.0)/100
 
 eta_rt = st.sidebar.number_input("Efficienza round-trip (%)", value=90.0)/100
-eta = math.sqrt(eta_rt)
-
 oneri = st.sidebar.number_input("Oneri evitati (€/MWh)", value=75.0)
-
-P_grid_in = st.sidebar.number_input("Limite immissione (MW)", value=7.0)
-P_grid_out = st.sidebar.number_input("Limite prelievo (MW)", value=9.0)
 
 # =========================
 # FILE
 # =========================
-file_prezzi = st.file_uploader("Prezzi")
-file_pv = st.file_uploader("Produzione FV")
-file_load = st.file_uploader("Consumi")
+st.header("📂 Upload dati")
 
-def read_file(f):
-    return pd.read_excel(f).iloc[:,0]
+file_prezzi = st.file_uploader("Prezzi", type=["xlsx","csv"])
+file_pv = st.file_uploader("Produzione FV", type=["xlsx","csv"])
+file_load = st.file_uploader("Consumi", type=["xlsx","csv"])
+
+def read_file(file):
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file).iloc[:,0]
+    else:
+        return pd.read_excel(file).iloc[:,0]
 
 # =========================
-# MILP
+# LOGICA OTTIMIZZAZIONE
 # =========================
-def optimize(prices, pv, load):
+def simulate(prices, pv, load):
 
     T = len(prices)
-    solver = pywraplp.Solver.CreateSolver("SCIP")
 
-    cg, cpv, dg, dl = [], [], [], []
-    soc, u = [], []
+    soc = np.zeros(T)
+    soc[0] = SoC_min * E_max
 
-    for t in range(T):
-        cg.append(solver.NumVar(0, P_charge, f"cg_{t}"))
-        cpv.append(solver.NumVar(0, P_charge, f"cpv_{t}"))
-        dg.append(solver.NumVar(0, P_discharge, f"dg_{t}"))
-        dl.append(solver.NumVar(0, P_discharge, f"dl_{t}"))
-        soc.append(solver.NumVar(SoC_min, SoC_max, f"soc_{t}"))
-        u.append(solver.IntVar(0,1,f"u_{t}"))
+    charge = np.zeros(T)
+    discharge = np.zeros(T)
 
-    # obiettivo
-    obj = solver.Objective()
-    for t in range(T):
-        obj.SetCoefficient(dg[t], prices[t])
-        obj.SetCoefficient(cg[t], -prices[t])
-        obj.SetCoefficient(cpv[t], -prices[t])
-        obj.SetCoefficient(dl[t], oneri)
-    obj.SetMaximization()
+    price_low = np.percentile(prices, 30)
+    price_high = np.percentile(prices, 70)
 
-    # vincoli
-    for t in range(T):
+    for t in range(1, T):
 
-        solver.Add(cg[t] + cpv[t] <= P_charge * u[t])
-        solver.Add(dg[t] + dl[t] <= P_discharge * (1-u[t]))
+        # PRIORITÀ 1: autoconsumo FV
+        excess_pv = max(0, pv[t] - load[t])
 
-        solver.Add(cg[t] <= P_grid_out)
-        solver.Add(dg[t] <= P_grid_in)
+        if excess_pv > 0:
+            charge_pv = min(P_max, excess_pv, (SoC_max*E_max - soc[t-1]))
+            charge[t] += charge_pv
 
-        if t == 0:
-            solver.Add(soc[t] == SoC_min + eta*(cg[t]+cpv[t]) - (dg[t]+dl[t])/eta)
-        else:
-            solver.Add(soc[t] == soc[t-1] + eta*(cg[t]+cpv[t]) - (dg[t]+dl[t])/eta)
+        # PRIORITÀ 2: arbitraggio
+        if prices[t] < price_low:
+            charge_grid = min(P_max - charge[t], SoC_max*E_max - soc[t-1])
+            charge[t] += charge_grid
 
-    solver.Solve()
+        elif prices[t] > price_high:
+            discharge[t] = min(P_max, soc[t-1] - SoC_min*E_max)
+
+        # update SOC
+        soc[t] = soc[t-1] + charge[t]*eta_rt - discharge[t]/eta_rt
+
+        soc[t] = max(SoC_min*E_max, min(SoC_max*E_max, soc[t]))
 
     df = pd.DataFrame({
         "Prezzo": prices,
         "PV": pv,
         "Load": load,
-        "Charge_grid": [cg[t].solution_value() for t in range(T)],
-        "Charge_PV": [cpv[t].solution_value() for t in range(T)],
-        "Discharge_grid": [dg[t].solution_value() for t in range(T)],
-        "Discharge_load": [dl[t].solution_value() for t in range(T)],
-        "SoC": [soc[t].solution_value() for t in range(T)]
+        "Charge": charge,
+        "Discharge": discharge,
+        "SoC": soc
     })
 
     # KPI economici
-    df["Revenue_market"] = df["Prezzo"]*df["Discharge_grid"]
-    df["Cost_charge"] = df["Prezzo"]*(df["Charge_grid"]+df["Charge_PV"])
-    df["Saving_oneri"] = df["Discharge_load"]*oneri
+    df["Revenue"] = df["Discharge"] * df["Prezzo"]
+    df["Cost"] = df["Charge"] * df["Prezzo"]
+    df["Saving_oneri"] = np.minimum(df["Discharge"], df["Load"]) * oneri
 
-    df["Profit"] = df["Revenue_market"] - df["Cost_charge"] + df["Saving_oneri"]
+    df["Profit"] = df["Revenue"] - df["Cost"] + df["Saving_oneri"]
 
     return df
 
@@ -107,7 +97,7 @@ def optimize(prices, pv, load):
 # =========================
 def export_excel(df):
 
-    daily = df.groupby(df.index//24).sum()
+    daily = df.groupby(df.index // 24).sum()
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -121,33 +111,39 @@ def export_excel(df):
 # =========================
 if file_prezzi and file_pv and file_load:
 
-    prices = read_file(file_prezzi)
-    pv = read_file(file_pv)
-    load = read_file(file_load)
+    prezzi = pd.to_numeric(read_file(file_prezzi), errors='coerce').dropna()
+    pv = pd.to_numeric(read_file(file_pv), errors='coerce').dropna()
+    load = pd.to_numeric(read_file(file_load), errors='coerce').dropna()
 
-    T = min(len(prices), len(pv), len(load))
+    T = min(len(prezzi), len(pv), len(load))
 
-    prices = prices[:T].values
+    prezzi = prezzi[:T].values
     pv = pv[:T].values
     load = load[:T].values
 
-    df = optimize(prices, pv, load)
+    df = simulate(prezzi, pv, load)
 
+    # =========================
     # KPI
+    # =========================
     st.header("📊 KPI")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("💰 Profit totale", round(df["Profit"].sum(),2))
-    col2.metric("📈 Ricavi mercato", round(df["Revenue_market"].sum(),2))
-    col3.metric("⚡ Risparmio oneri", round(df["Saving_oneri"].sum(),2))
+    col1, col2, col3, col4 = st.columns(4)
 
-    # grafici
+    col1.metric("💰 Profit totale (€)", round(df["Profit"].sum(),2))
+    col2.metric("📈 Ricavi mercato", round(df["Revenue"].sum(),2))
+    col3.metric("⚡ Risparmio oneri", round(df["Saving_oneri"].sum(),2))
+    col4.metric("🔋 Cicli eq.", round(df["Discharge"].sum()/(2*E_max),2))
+
+    # =========================
+    # GRAFICI
+    # =========================
     st.header("📉 Andamento")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=df["Prezzo"], name="Prezzo"))
-    fig.add_trace(go.Bar(y=df["Charge_grid"], name="Carica"))
-    fig.add_trace(go.Bar(y=df["Discharge_grid"], name="Scarica"))
+    fig.add_trace(go.Bar(y=df["Charge"], name="Carica"))
+    fig.add_trace(go.Bar(y=df["Discharge"], name="Scarica"))
     st.plotly_chart(fig, use_container_width=True)
 
     fig2 = go.Figure()
@@ -156,11 +152,13 @@ if file_prezzi and file_pv and file_load:
 
     st.dataframe(df)
 
-    # download
+    # =========================
+    # DOWNLOAD
+    # =========================
     st.download_button(
         "📥 Scarica Excel",
         data=export_excel(df),
-        file_name="bess_analysis.xlsx"
+        file_name="bess_results.xlsx"
     )
 
 else:
