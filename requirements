@@ -3,4 +3,4 @@ pandas
 numpy
 plotly
 openpyxl
-ortools
+ortools==9.6.2534
